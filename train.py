@@ -129,7 +129,7 @@ def train(generator, critic, dataloader, device, options):
             if batch is None:
                 dataiter = iter(dataloader)
                 batch = dataiter.next()
-            batch = batch[0] #batch[1] contains labels
+            batch = batch[0] # batch[1] contains labels
             real_data = batch.to(device)
 
             critic_real = critic(real_data).mean()
