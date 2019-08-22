@@ -1,8 +1,9 @@
 import os
-import random
-import glob
+import math
 import json
+import importlib
 import argparse
+from timeit import default_timer as timer
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,11 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
 
+log_statistics = importlib.util.find_spec("tensorboardX") is not None
+if log_statistics:
+    from tensorboardX import SummaryWriter
+
+from train import gradient_penalty
 
 # Patch-GAN
 # patch-size = 64
@@ -96,76 +102,81 @@ def get_next(dataloader):
     right = x[:, :, :, w:]
     return (left, right)
 
-def fake_labels(batch_size):
-    labels = []
-    for _ in range(batch_size):
-        x = random.uniform(0, 0.1)
-        labels.append(x)
-    return torch.FloatTensor(labels)
-
-def real_labels(batch_size):
-    labels = []
-    for _ in range(batch_size):
-        x = random.uniform(0.9, 1)
-        labels.append(x)
-    return torch.FloatTensor(labels)
-
-def step(generator, critic, optimizer_g, optimizer_c, dataiter, device, options):
-    criterion = nn.BCELoss()
-    l1 = nn.L1Loss()
-
-    # Discriminator pass
-    # Real datum
-    optimizer_c.zero_grad()
-    inputs, outputs = get_next(dataiter)
-    labels = real_labels(options.batch_size)
-
-    inputs = inputs.to(device)
-    outputs = outputs.to(device)
-    labels = labels.to(device)
-
-    predictions = critic(torch.cat((inputs, outputs), dim=1))
-    critic_loss_real = criterion(predictions, labels)
-
-    # Fake datum
-    optimizer_c.zero_grad()
-    inputs, _ = get_next(dataiter)
-    labels = fake_labels(options.batch_size)
-
-    inputs = inputs.to(device)
-    labels = labels.to(device)
-    outputs = generator(inputs).detach()
-
-    predictions = critic(torch.cat((inputs, outputs), dim=1))
-    critic_loss_fake = criterion(predictions, labels)
-
-    critic_loss = critic_loss_real + critic_loss_fake
-    critic_loss.backward()
-    optimizer_c.step()
-
-    # Generator pass
-    optimizer_g.zero_grad()
-    inputs, outputs = get_next(dataiter)
-    labels = torch.ones(options.batch_size)
-
-    inputs = inputs.to(device)
-    labels = labels.to(device)
-    generated = generator(inputs)
-
-    predictions = critic(torch.cat((inputs, generated), dim=1))
-    generator_loss = criterion(predictions, labels) + options.l1_weight * l1(predictions, labels)
-    generator_loss.backward()
-    optimizer_g.step()
-
-    return generator_loss.item(), critic_loss.item()
-
 def train(generator, critic, optimizer_g, optimizer_c, dataiter, device, options):
+    generator_path = os.path.join(options.model_dir, 'generator.pt')
+    critic_path = os.path.join(options.model_dir, 'critic.pt')
+    best_distance = math.inf
+    minus_one = torch.FloatTensor([-1]).to(device)
+    l1 = nn.L1Loss()
+    if log_statistics:
+        writer = SummaryWriter()
 
     for epoch in range(options.epochs):
-        print(f'{epoch}/{options.epochs}')
-        generator_loss, critic_loss = step(generator, critic, optimizer_g, optimizer_c, dataiter, device, options)
-        print('Generator loss: %.6f / Discriminator loss: %.6f' % (generator_loss, critic_loss))
+        print(f'*** Epoch: {epoch + 1}/{options.epochs}')
 
+        # Generator pass
+        start = timer()
+        for p in critic.parameters():
+            p.requires_grad_(False)  # freeze the critic
+
+        generator_cost = None
+        for i in range(options.generator_iterations):
+            generator.zero_grad()
+            inputs, _ = get_next(dataiter)
+            inputs = inputs.to(device)
+            inputs.requires_grad_(True)
+
+            generated = generator(inputs)
+            fake_data = torch.cat((inputs, generated), dim=1)
+
+            generator_cost = critic(fake_data)
+            generator_cost = generator_cost.mean()
+            generator_cost.backward(minus_one)
+            generator_cost = -generator_cost
+
+            print(f'Generator iteration: {i}, Cost: {generator_cost}')
+            optimizer_g.step()
+
+        end = timer()
+        print(f'  Generator elapsed time: {end - start}')
+
+        # Critic pass
+        start = timer()
+
+        for p in critic.parameters():
+            p.requires_grad_(True) # unfreeze the critic
+
+        for i in range(options.critic_iterations):
+            critic.zero_grad()
+            # Generate fake data and load real data
+            inputs, _ = get_next(dataiter)
+            inputs = inputs.to(device)
+
+            generated = generator(inputs)
+            fake_data = torch.cat((inputs, generated), dim=1).detach()
+            inputs, outputs = get_next(dataiter)
+            real_data = torch.cat((inputs, outputs), dim=1).to(device)
+
+            critic_real = critic(real_data).mean()
+            critic_fake = critic(fake_data).mean()
+            penalty = gradient_penalty(critic, real_data, fake_data, options.gradient_penalty, device)
+            critic_cost = critic_fake - critic_real + penalty
+            critic_cost.backward()
+
+            wasserstein_distance = (critic_real - critic_fake).item()
+            print(f'Critic iteration: {i}, Wasserstein distance: {wasserstein_distance}')
+            optimizer_c.step()
+
+        end = timer()
+        print(f'  Critic elapsed time: {end - start}')
+
+        # Save models
+        if wasserstein_distance < best_distance:
+            best_distance = wasserstein_distance
+            torch.save(generator, generator_path)
+            torch.save(critic, critic_path)
+
+        # Generate images
         if epoch % options.sample_every == 0:
             inputs, origs = get_next(dataiter)
             input = inputs[0].to(device)
@@ -173,6 +184,13 @@ def train(generator, critic, optimizer_g, optimizer_c, dataiter, device, options
             image_tensor = torch.cat((output.data.to('cpu'), input.data.to('cpu'), origs[0]), dim=2)
             image = transforms.ToPILImage()((image_tensor + 1) / 2)
             image.save(os.path.join(options.output_dir, f'sample_{epoch}.jpg'))
+
+        # Log statistics
+        if log_statistics:
+            writer.add_scalar('data/generator_cost', generator_cost, epoch)
+            writer.add_scalar('data/critic_cost', critic_cost, epoch)
+            writer.add_scalar('data/gradient_penalty', penalty, epoch)
+            writer.add_scalar('data/W1', critic_real - critic_fake, epoch)
 
 def parse_options():
     parser = argparse.ArgumentParser(description='Pix2pix with Wasserstein GAN')
@@ -189,6 +207,8 @@ def parse_options():
     parser.add_argument('--critic-channels', type=int, default=4, help='number of channels for the critic')
     parser.add_argument('--gradient-penalty', type=float, default=10, help='gradient penalty')
     parser.add_argument('--epochs', type=int, default=10000, help='number of epochs')
+    parser.add_argument('--generator-iterations', type=int, default=1, help='number of iterations for the generator')
+    parser.add_argument('--critic-iterations', type=int, default=5, help='number of iterations for the critic')
     parser.add_argument('--sample-every', type=int, default=1000, help='how often to sample images')
 
     return parser.parse_args()
