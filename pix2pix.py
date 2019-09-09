@@ -122,15 +122,17 @@ def train(generator, critic, optimizer_g, optimizer_c, dataiter, device, options
         generator_cost = None
         for i in range(options.generator_iterations):
             generator.zero_grad()
-            inputs, _ = get_next(dataiter)
+            inputs, outputs = get_next(dataiter)
             inputs = inputs.to(device)
+            outputs = outputs.to(device)
             inputs.requires_grad_(True)
+            outputs.requires_grad_(True)
 
             generated = generator(inputs)
             fake_data = torch.cat((inputs, generated), dim=1)
 
             generator_cost = critic(fake_data)
-            generator_cost = generator_cost.mean()
+            generator_cost = generator_cost.mean()  + options.l1_weight * l1(generated, outputs)
             generator_cost.backward(minus_one)
             generator_cost = -generator_cost
 
